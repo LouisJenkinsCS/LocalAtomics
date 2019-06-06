@@ -8,9 +8,9 @@ module LocalAtomics {
   */
 
   extern {
-    #include <stdint.h>
-    #include <stdio.h>
-    #include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
     struct uint128 {
       uint64_t lo;
@@ -90,15 +90,93 @@ module LocalAtomics {
   }
 
   extern type atomic_uint_least64_t;
-   
+  // We require this to create a wide pointer after decompression.
+  extern type wide_ptr_t;
+  extern type c_nodeid_t;
+  extern proc chpl_return_wide_ptr_node(c_nodeid_t, c_void_ptr) : wide_ptr_t;
 
   /*
-    Wrapper for an object protected by an ABA counter. This type forwards to the object
-    represented by its underlying pointer and hence can be used as if it were the object
-    itself, via 'forwarding'. This type should not be created by the user, and instead
-    should be created by LocalAtomicObject. The object protected by this ABA wrapper can
-    be extracted via 'getObject'
-  */
+     The core `GlobalAtomicObject` which manages compression and decompression
+     for atomic objects. It should be noted that if numLocales >= 2^17, then any
+     object being operated on is added to the descriptor table, which will leak data
+     if never freed with '_delete' (although if the memory is reused,
+     so will the memory managed by this object). The descriptor table will be cleaned
+     up automatically when this goes out of scope.
+     */
+
+  param compressedAddrMask = 0x0000FFFFFFFFFFFF;
+  param compressedLocaleIdMask = 0xFFFF;
+  param tableLocaleIdMask = 0xFFFFFFFF;
+  param tableIdxMask = 0xFFFFFFFF;
+  param compressedLocIdOffset = 48;
+
+  inline proc uintToCVoidPtr(addr) {
+    return __primitive("cast", c_void_ptr, addr);
+  }
+
+  // This is busted: $CHPL_HOME/test/optimizations/widepointers/return.future
+  inline proc widePointerCheck(obj) {
+    if !__primitive("is wide pointer", obj) {
+      compilerError(
+          "Dummy object created was not a wide pointer!",
+          " Assumption: Inside a 'local' block"
+          );
+    }
+  }
+
+  inline proc getAddrAndLocality(obj) : (locale, uint(64)) {
+    return (obj.locale, getAddr(obj));
+  }
+
+  inline proc getAddr(obj) : uint(64) {
+    return __primitive("cast", uint(64), __primitive("_wide_get_addr", obj));
+  }
+
+
+  /*
+     Compresses an object into a descriptor.
+     */
+  proc compress(obj) : uint {
+    if obj == nil then return 0;
+
+    // Perform a faster compression by packing the 48 usable bits of the virtual
+    // address with 16 bits of the locale/node id.
+    var locId : uint(64) = obj.locale.id : uint(64);
+    var addr = getAddr(obj);
+    return (locId << compressedLocIdOffset) | (addr & compressedAddrMask);
+  }
+
+  /*
+     Decompresses a descriptor into the wide pointer object.
+     */
+  proc decompress(type objType, descr:uint) : objType {
+    if descr == 0 then return nil;
+
+    // If we have less than 2^16 locales, then we know we performed the
+    // faster compression method so we need to decompress it in the same way...
+    var locId = descr >> compressedLocIdOffset;
+    var addr = descr & compressedAddrMask;
+    if locId == 0 then return __primitive("cast", objType, uintToCVoidPtr(addr));
+
+    // We've created the wide pointer, but unfortunately Chapel does not support
+    // the ability to cast it to the actual object, so we have to do some
+    // trickery to get it to work. What we do is we allocate a wide pointer on
+    // the stack and memcpy our wideptr into the other. This is needed so we
+    // have the same type.
+    var wideptr = chpl_return_wide_ptr_node(locId, uintToCVoidPtr(addr));
+    var newObj : objType;
+    on Locales[here.id] do newObj = nil;
+    c_memcpy(c_ptrTo(newObj), c_ptrTo(wideptr), 16);
+    return newObj;
+  }
+
+  /*
+     Wrapper for an object protected by an ABA counter. This type forwards to the object
+     represented by its underlying pointer and hence can be used as if it were the object
+     itself, via 'forwarding'. This type should not be created by the user, and instead
+     should be created by LocalAtomicObject. The object protected by this ABA wrapper can
+     be extracted via 'getObject'. 
+     */
   record ABA {
     type objType;
     // Runtime version of atomics so that we can read these without overhead
@@ -124,13 +202,13 @@ module LocalAtomics {
 
     inline proc getObject() {
       var ptr = this._ABA_ptr;
-      return __primitive("cast", objType, this._ABA_ptr.read());
+      return __primitive("cast", objType, decompress(objType, this._ABA_ptr.read()));
     }
-    
+
     inline proc getABACounter() {
       return this._ABA_cnt.read();
     }
-    
+
 
     proc readWriteThis(f) {
       f <~> "ptr: " <~> getObject() <~> ", cnt: " <~> getABACounter();
@@ -139,6 +217,13 @@ module LocalAtomics {
     forwarding getObject();
   }
 
+  /*
+     Provides a software solution to the problem of applying atomic operations using
+     128-bit wide pointers via compression. The algorithm used for compression (and
+     decompression) rely on the number locales. In majority of cases where numLocales
+     is within a 16 bit range, we can encode it in the upper 16 bits of the address
+     as only 2^48 bits of the virtual address space is ever used.
+     */
   record LocalAtomicObject {
     type objType;
     var atomicVar : c_ptr(ABA(objType));
@@ -162,16 +247,9 @@ module LocalAtomics {
       posix_memalign(c_ptrTo(ptr), 16, c_sizeof(ABA(objType)));
       this.atomicVar = ptr;
       c_memset(atomicVar, 0, c_sizeof(ABA(objType)));      
-      this.atomicVar[0]._ABA_ptr.write(getAddr(defaultValue));
+      this.atomicVar[0]._ABA_ptr.write(compress(defaultValue));
     }
 
-    inline proc getAddrAndLocality(obj : objType) : (locale, uint(64)) {
-      return (obj.locale, getAddr(obj));
-    }
-
-    inline proc getAddr(obj : objType) : uint(64) {
-      return __primitive("cast", uint(64), __primitive("_wide_get_addr", obj));
-    }
 
     inline proc localityCheck(objs...) {
       if boundsChecking && (|| reduce [obj in objs] obj.locale != this.locale) then
@@ -190,35 +268,35 @@ module LocalAtomics {
 
     proc compareExchange(expectedObj : objType, newObj : objType) : bool {
       localityCheck(expectedObj, newObj);
-      return atomicVar[0]._ABA_ptr.compareExchange(getAddr(expectedObj), getAddr(newObj));
+      return atomicVar[0]._ABA_ptr.compareExchange(compress(expectedObj), compress(newObj));
     }
 
     proc compareExchangeABA(expectedObj : ABA(objType), newObj : objType) : bool {
       localityCheck(newObj);
       var cmp = expectedObj;
-      var val = new ABA(objType, getAddr(newObj), atomicVar[0].getABACounter() + 1);
+      var val = new ABA(objType, compress(newObj), atomicVar[0].getABACounter() + 1);
       return cas128bit(atomicVar, c_ptrTo(cmp), c_ptrTo(val)) : bool;
     }
-    
+
     proc compareExchangeABA(expectedObj : ABA(objType), newObj : ABA(objType)) : bool {
       compareExchangeABA(expectedObj, newObj.getObject());
     }
 
     proc write(newObj:objType) {
       localityCheck(newObj);
-      atomicVar[0]._ABA_ptr.write(getAddr(newObj));
+      atomicVar[0]._ABA_ptr.write(compress(newObj));
     }
 
     proc write(newObj:ABA(objType)) {
       write(newObj.getObject());
     }
-    
+
     proc writeABA(newObj: ABA(objType)) {
       write128bit(atomicVar, c_ptrTo(newObj));
     }
 
     proc writeABA(newObj: objType) {
-      writeABA(new ABA(objType, getAddr(objType), atomicVar[0].getABACounter() + 1));
+      writeABA(new ABA(objType, compress(objType), atomicVar[0].getABACounter() + 1));
     }
 
     inline proc exchange(newObj:objType) {
@@ -249,7 +327,7 @@ module LocalAtomics {
   class C {
     var x : int;
   }
-  
+
   proc main() {
     var x = new unmanaged C(1);
     var atomicObj = new LocalAtomicObject(unmanaged C);
