@@ -2,7 +2,7 @@
  * Created by Garvit Dewan - 
  * https://github.com/dgarvit/epoch-based-manager/blob/master/src/LockFreeQueue.chpl
  *   
- * Lock-Free Queue that uses ABA feature of Distributed Data Structures
+ * Lock-Free Queue that uses ABA feature of LocalAtomicObject
  * Based on Michael Scott Queue
  */
 module LockFreeQueue {
@@ -21,7 +21,6 @@ module LockFreeQueue {
 
     proc init(type eltType) {
       this.eltType = eltType;
-      val = nil;
     }
   }
 
@@ -60,7 +59,7 @@ module LockFreeQueue {
         var curr_head = _head.readABA();
         var curr_tail = _tail.readABA();
         var next = curr_head.next.readABA();
-        if (_head.read() == _tail.read()) {
+        if (curr_head.getObject() == curr_tail.getObject()) {
           if (next.getObject() == nil) then
             return nil;
           _tail.compareExchangeABA(curr_tail, next.getObject());
@@ -82,7 +81,10 @@ module LockFreeQueue {
     }
 
     proc peek() : objType {
-      return _head.read().next.read().val;
+      var actual_head = _head.read().next.read();
+      if (actual_head != nil) then
+        return actual_head.val;
+      return nil;
     }
 
     proc deinit() {
