@@ -74,8 +74,9 @@ module LockFreeStack {
   
   proc main() {
     var a = new LockFreeStack(int);
-    forall i in 1..1024 do a.push(i);
-    a.push(1025..2048);
+    coforall loc in Locales do on loc {
+      forall i in here.id * 1024 .. #1024 do a.push(i);
+    }
     writeln(+ reduce a);
   }
 }

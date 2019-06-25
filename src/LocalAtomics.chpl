@@ -226,7 +226,7 @@ module LocalAtomics {
      */
   record LocalAtomicObject {
     type objType;
-    var atomicVar : c_ptr(ABA(objType));
+    var atomicVar : _ddata(ABA(objType));
 
     proc init(type objType) {
       if !isUnmanagedClass(objType) then compilerError("LocalAtomicObject must take a 'unmanaged' type, not ", objType : string);
@@ -234,8 +234,8 @@ module LocalAtomics {
       this.complete();
       var ptr : c_void_ptr;
       posix_memalign(c_ptrTo(ptr), 16, c_sizeof(ABA(objType)));
-      this.atomicVar = ptr;
-      c_memset(atomicVar, 0, c_sizeof(ABA(objType)));
+      this.atomicVar = ptr:_ddata(ABA(objType));
+      c_memset(ptr, 0, c_sizeof(ABA(objType)));
     }
 
     proc init(type objType, defaultValue : objType) {
@@ -245,7 +245,7 @@ module LocalAtomics {
       localityCheck(defaultValue);
       var ptr : c_void_ptr;
       posix_memalign(c_ptrTo(ptr), 16, c_sizeof(ABA(objType)));
-      this.atomicVar = ptr;
+      this.atomicVar = ptr:_ddata(ABA(objType));
       c_memset(atomicVar, 0, c_sizeof(ABA(objType)));      
       this.atomicVar[0]._ABA_ptr.write(compress(defaultValue));
     }
@@ -257,9 +257,13 @@ module LocalAtomics {
     }
 
     proc readABA() : ABA(objType) {
-      var dest : ABA(objType);
-      read128bit(atomicVar, c_ptrTo(dest));
-      return dest;
+      var ret : ABA(objType);
+      on this {
+        var dest : ABA(objType);
+        read128bit(atomicVar:c_void_ptr, c_ptrTo(dest));
+        ret = dest;
+      }
+      return ret;
     }
 
     proc read() : objType {
@@ -267,15 +271,17 @@ module LocalAtomics {
     }
 
     proc compareExchange(expectedObj : objType, newObj : objType) : bool {
-      localityCheck(expectedObj, newObj);
       return atomicVar[0]._ABA_ptr.compareExchange(compress(expectedObj), compress(newObj));
     }
 
     proc compareExchangeABA(expectedObj : ABA(objType), newObj : objType) : bool {
-      localityCheck(newObj);
-      var cmp = expectedObj;
-      var val = new ABA(objType, compress(newObj), atomicVar[0].getABACounter() + 1);
-      return cas128bit(atomicVar, c_ptrTo(cmp), c_ptrTo(val)) : bool;
+      var ret : bool;
+      on this {
+        var cmp = expectedObj;
+        var val = new ABA(objType, compress(newObj), atomicVar[0].getABACounter() + 1);
+        ret = cas128bit(atomicVar:c_void_ptr, c_ptrTo(cmp), c_ptrTo(val)) : bool;
+      }
+      return ret;
     }
 
     proc compareExchangeABA(expectedObj : ABA(objType), newObj : ABA(objType)) : bool {
@@ -283,7 +289,6 @@ module LocalAtomics {
     }
 
     proc write(newObj:objType) {
-      localityCheck(newObj);
       atomicVar[0]._ABA_ptr.write(compress(newObj));
     }
 
@@ -300,7 +305,7 @@ module LocalAtomics {
     }
 
     inline proc exchange(newObj:objType) {
-      compilerError("Exchange is not implemented yet!!!");
+      return decompress(objType, atomicVar[0]._ABA_ptr.exchange(compress(newObj)));
     }
 
     // handle wrong types
@@ -346,6 +351,9 @@ module LocalAtomics {
     writeln(atomicObj.read());
     writeln(atomicObj.readABA());
     writeln(atomicObj.compareExchange(w, x));
+    writeln(atomicObj.read());
+    writeln(atomicObj.readABA());
+    writeln(atomicObj.exchange(nil));
     writeln(atomicObj.read());
     writeln(atomicObj.readABA());
   }
